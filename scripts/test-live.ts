@@ -54,8 +54,18 @@ async function fakeTranscribe(samples: Float32Array): Promise<string> {
   return '字'.repeat(Math.round(voiced / 10))
 }
 
-async function stream(audio: Float32Array, onText: (t: string) => void, reads: (s: Float32Array) => void) {
-  const live = createLivePreview(async (s) => (reads(s), fakeTranscribe(s)), (done, tail) => onText(done.join('') + tail))
+async function stream(
+  audio: Float32Array,
+  onView: (v: { text: string; full: string; split: number }) => void,
+  reads: (s: Float32Array) => void
+) {
+  // What the card is told: the words, and where the settled part ends. A sentence
+  // that settles was the tail a moment ago, so the words can be the same while the
+  // card still changes — the tail turns white.
+  const live = createLivePreview(
+    async (s) => (reads(s), fakeTranscribe(s)),
+    (done, tail) => onView({ text: done.join('') + tail, ...joinLive(displayText(done, [], tail)) })
+  )
   const chunk = RATE / 5 // 200 ms, like the recorder; fed 4x faster than real time
   for (let at = 0; at < audio.length; at += chunk) {
     live.push(audio.subarray(at, at + chunk))
@@ -67,16 +77,48 @@ async function stream(audio: Float32Array, onText: (t: string) => void, reads: (
 }
 
 void (async () => {
-  const texts: string[] = []
+  const views: { text: string; full: string; split: number }[] = []
   let longest = 0
   // 4 s, pause, 5 s, pause, 3 s: 12 characters in all
   const speech = concat(voice(4), quiet(0.6), voice(5), quiet(0.6), voice(3))
-  const stats = await stream(speech, (t) => texts.push(t), (s) => (longest = Math.max(longest, s.length / RATE)))
+  const stats = await stream(speech, (v) => views.push(v), (s) => (longest = Math.max(longest, s.length / RATE)))
+  const texts = views.map((v) => v.text)
   const last = texts.at(-1) ?? ''
-  check('preview grows as the user talks', texts.length >= 3 && texts.every((t, i) => i === 0 || t !== texts[i - 1]), texts.join(' | '))
+  // The card is told the words and where the settled part ends, so what has to
+  // change every time is that pair: a sentence that settles was the tail a
+  // moment ago, so the words may be the same while the card still changes.
+  check(
+    'preview grows as the user talks',
+    views.length >= 3 &&
+      views.every((v, i) => i === 0 || v.full !== views[i - 1].full || v.split !== views[i - 1].split),
+    views.map((v) => `${v.full}#${v.split}`).join(' | ')
+  )
   check('preview ends with everything said', last.length === 12, `${last.length} chars: ${texts.join(' | ')}`)
   check('settled sentences are not read again', longest < 6.5, `longest read ${longest.toFixed(1)} s`)
   check('reads are counted', stats.runs >= 3 && stats.maxMs > 0, JSON.stringify(stats))
+
+  // A sentence that settles was the tail a moment ago: the words on the card do
+  // not change, only their place does — the tail turns white. The card must be
+  // told that, so what it gets has to change even when the words do not.
+  {
+    const views: { full: string; split: number }[] = []
+    const preview = createLivePreview(fakeTranscribe, (done, tail) => {
+      views.push(joinLive(displayText(done, [], tail)))
+    })
+    preview.push(voice(4))
+    await new Promise((r) => setTimeout(r, GAP_MS * 2)) // the read sees the voice, no pause yet
+    preview.push(quiet(0.25))
+    await new Promise((r) => setTimeout(r, GAP_MS * 2)) // 250 ms of quiet: too short to settle
+    preview.push(quiet(0.3))
+    await new Promise((r) => setTimeout(r, GAP_MS * 2)) // 550 ms of quiet: the sentence settles
+    await preview.stop()
+    const last = views.at(-1)
+    check(
+      'a settled sentence is shown as settled',
+      !!last && last.split > 0 && last.full.length > 0,
+      JSON.stringify(views)
+    )
+  }
 
   // stop() waits for the read in flight, and nothing is read after it
   let reading = 0
